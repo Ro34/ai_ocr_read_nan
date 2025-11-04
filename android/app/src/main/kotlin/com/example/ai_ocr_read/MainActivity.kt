@@ -33,6 +33,14 @@ class MainActivity : FlutterActivity() {
 
 		MethodChannel(messenger, channelName).setMethodCallHandler { call, result ->
 			when (call.method) {
+				"getMaxMessageLength" -> {
+					if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+						result.success(0)
+					} else {
+						if (nan == null) nan = NanManager(this)
+						result.success(nan!!.getMaxMessageLength())
+					}
+				}
 				"isAvailable" -> {
 					if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
 						result.success(false)
@@ -82,8 +90,12 @@ class MainActivity : FlutterActivity() {
 				}
 				"broadcast" -> {
 					val text = call.argument<String>("text") ?: "hello"
-					nan?.broadcast(text)
-					result.success(true)
+					try {
+						nan?.broadcast(text)
+						result.success(true)
+					} catch (t: Throwable) {
+						result.error("broadcast", t.message, null)
+					}
 				}
 				"release" -> {
 					nan?.release()

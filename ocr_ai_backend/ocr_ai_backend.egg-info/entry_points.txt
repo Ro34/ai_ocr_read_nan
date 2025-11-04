@@ -1,0 +1,2 @@
+[console_scripts]
+ocr-ai-backend = main:run

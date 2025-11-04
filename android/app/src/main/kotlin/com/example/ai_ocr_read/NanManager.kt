@@ -73,6 +73,28 @@ class NanManager(private val context: Context) {
         }
     }
 
+    /**
+     * 返回设备支持的 sendMessage 最大字节数。如果系统未提供公开 API，则通过反射尝试；
+     * 若仍不可得，返回一个保守的回退值。
+     */
+    fun getMaxMessageLength(): Int {
+        val a = aware ?: return 0
+        return try {
+            val ch = a.javaClass.getMethod("getCharacteristics").invoke(a)
+            // 优先尝试 getMaxMessageLength（较新的 API）
+            val m1 = ch.javaClass.methods.firstOrNull { it.name == "getMaxMessageLength" }
+            if (m1 != null) {
+                (m1.invoke(ch) as? Int) ?: 0
+            } else {
+                // 一些系统方法名可能不同，兼容 getMaxSendMessageLength
+                val m2 = ch.javaClass.methods.firstOrNull { it.name == "getMaxSendMessageLength" }
+                if (m2 != null) (m2.invoke(ch) as? Int) ?: 0 else 0
+            }
+        } catch (_: Throwable) {
+            0
+        }.let { if (it > 0) it else 1800 } // 回退一个保守值
+    }
+
     fun attach(onSuccess: (() -> Unit)? = null, onError: ((String) -> Unit)? = null) {
         val a = aware ?: run {
             onError?.invoke("WifiAware not supported")
@@ -90,6 +112,12 @@ class NanManager(private val context: Context) {
                 Log.d(tag, "attach success")
                 session = sess
                 emit(mapOf("type" to "attached"))
+                // 连接成功后主动上报设备可发送的最大消息长度，便于 Flutter 侧记录
+                try {
+                    val max = getMaxMessageLength()
+                    Log.d(tag, "maxMessageLen=$max")
+                    emit(mapOf("type" to "maxMessageLen", "max" to max))
+                } catch (_: Throwable) {}
                 onSuccess?.invoke()
             }
 
@@ -137,7 +165,7 @@ class NanManager(private val context: Context) {
             }
 
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) {
-                val text = try { String(message) } catch (_: Throwable) { "<bin>" }
+                val text = try { String(message, StandardCharsets.UTF_8) } catch (_: Throwable) { "<bin>" }
                 Log.d(tag, "publish received from peer: $text")
                 if (!pubPeers.contains(peerHandle)) pubPeers.add(peerHandle)
                 // 尝试解析消息信封中的 sender 以去重与映射
@@ -226,7 +254,7 @@ class NanManager(private val context: Context) {
             }
 
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) {
-                val text = try { String(message) } catch (_: Throwable) { "<bin>" }
+                val text = try { String(message, StandardCharsets.UTF_8) } catch (_: Throwable) { "<bin>" }
                 Log.d(tag, "sub received: $text")
                 if (!subPeers.contains(peerHandle)) subPeers.add(peerHandle)
                 // 尝试解析信封，新增对端 ID 并上报 peers 变化
@@ -255,20 +283,49 @@ class NanManager(private val context: Context) {
     fun sendMessage(peer: PeerHandle, text: String) {
         val id = msgId.getAndIncrement()
         val data = text.toByteArray(StandardCharsets.UTF_8)
+        // 发送前长度预检查，避免抛出系统异常导致 MethodChannel 报错
+        try {
+            val max = getMaxMessageLength()
+            if (max > 0 && data.size > max) {
+                Log.w(tag, "precheck too long: size=${data.size} max=$max")
+                emit(mapOf("type" to "send", "via" to "precheck", "result" to "too_long", "len" to data.size, "max" to max))
+                return
+            }
+        } catch (_: Throwable) {}
         // 优先使用发现该 peer 的同源会话
         val s = sub
         if (s != null && subPeers.contains(peer)) {
-            s.sendMessage(peer, id, data)
-            return
+            try {
+                s.sendMessage(peer, id, data)
+                return
+            } catch (t: Throwable) {
+                Log.w(tag, "sub send exception: ${t.message}")
+                emit(mapOf("type" to "send", "via" to "subscribe", "result" to "exception", "id" to id, "error" to (t.message ?: "error")))
+                return
+            }
         }
         val p = pub
         if (p != null && pubPeers.contains(peer)) {
-            p.sendMessage(peer, id, data)
-            return
+            try {
+                p.sendMessage(peer, id, data)
+                return
+            } catch (t: Throwable) {
+                Log.w(tag, "publish send exception: ${t.message}")
+                emit(mapOf("type" to "send", "via" to "publish", "result" to "exception", "id" to id, "error" to (t.message ?: "error")))
+                return
+            }
         }
         // 兜底尝试（可能失败）
-        try { s?.sendMessage(peer, id, data) } catch (_: Throwable) {}
-        try { p?.sendMessage(peer, id, data) } catch (_: Throwable) {}
+        try { s?.sendMessage(peer, id, data) } catch (t: Throwable) {
+            Log.w(tag, "fallback sub send exception: ${t.message}")
+            emit(mapOf("type" to "send", "via" to "subscribe", "result" to "exception", "id" to id, "error" to (t.message ?: "error")))
+            return
+        }
+        try { p?.sendMessage(peer, id, data) } catch (t: Throwable) {
+            Log.w(tag, "fallback publish send exception: ${t.message}")
+            emit(mapOf("type" to "send", "via" to "publish", "result" to "exception", "id" to id, "error" to (t.message ?: "error")))
+            return
+        }
     }
 
     fun broadcast(text: String) {

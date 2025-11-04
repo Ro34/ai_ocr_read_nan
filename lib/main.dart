@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:async';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:http/http.dart' as http;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -13,33 +14,34 @@ void main() {
   runApp(const MyApp());
 }
 
+class _BuiltMsg {
+  final String message;
+  final bool truncated;
+  const _BuiltMsg(this.message, this.truncated);
+}
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
-    // 多巴胺风格：更鲜艳的配色（主色：亮粉；辅色：电光青；三级：明黄）
-      const seed = Color(0xFF10B981); // Emerald 500
-      final baseLight = ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.light);
-      final lightScheme = baseLight.copyWith(
-        secondary: const Color(0xFF06B6D4), // Cyan 400
-        tertiary: const Color(0xFF84CC16),  // Lime 500
-      );
-      final baseDark = ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.dark);
-      final darkScheme = baseDark.copyWith(
-        secondary: const Color(0xFF06B6D4),
-        tertiary: const Color(0xFF84CC16),
-      );
+    const seed = Color(0xFF10B981);
+    final baseLight = ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.light);
+    final lightScheme = baseLight.copyWith(
+      secondary: const Color(0xFF06B6D4),
+      tertiary: const Color(0xFF84CC16),
+    );
+    final baseDark = ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.dark);
+    final darkScheme = baseDark.copyWith(
+      secondary: const Color(0xFF06B6D4),
+      tertiary: const Color(0xFF84CC16),
+    );
     return MaterialApp(
       title: 'AI OCR Read',
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: lightScheme,
-        appBarTheme: const AppBarTheme(
-          centerTitle: true,
-          elevation: 0,
-        ),
+        appBarTheme: const AppBarTheme(centerTitle: true, elevation: 0),
         filledButtonTheme: FilledButtonThemeData(
           style: FilledButton.styleFrom(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -61,10 +63,7 @@ class MyApp extends StatelessWidget {
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           margin: EdgeInsets.zero,
         ),
-        snackBarTheme: const SnackBarThemeData(
-          behavior: SnackBarBehavior.floating,
-          showCloseIcon: true,
-        ),
+        snackBarTheme: const SnackBarThemeData(behavior: SnackBarBehavior.floating, showCloseIcon: true),
       ),
       darkTheme: ThemeData(
         useMaterial3: true,
@@ -101,18 +100,7 @@ class MyApp extends StatelessWidget {
 
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
   final String title;
-
   @override
   State<MyHomePage> createState() => _MyHomePageState();
 }
@@ -131,20 +119,30 @@ class _MyHomePageState extends State<MyHomePage> {
   String? _deviceId;
   int _msgSeq = 0;
   bool _nanStarting = false;
-  String? _roomCode; // 可配置的房间码
+  String? _roomCode;
   final TextEditingController _roomController = TextEditingController();
+  int? _nanMaxMsgLen;
+  String? _backendBaseUrl;
+  final TextEditingController _backendController = TextEditingController();
+  final List<String> _debugLogs = [];
 
   @override
   void initState() {
     super.initState();
     _initDeviceId();
     _initRoomCode();
+    _initBackendBaseUrl();
     _nanSub = _nanEvents.receiveBroadcastStream().listen((event) {
       if (!mounted) return;
       try {
         final map = Map<String, dynamic>.from(event as Map);
         final type = map['type'] as String?;
         switch (type) {
+          case 'maxMessageLen':
+            final max = map['max'];
+            _appendNanLog('maxMessageLen=$max');
+            debugPrint('NAN maxMessageLen=$max');
+            break;
           case 'attached':
             setState(() => _nanStatus = '已附着');
             break;
@@ -198,25 +196,56 @@ class _MyHomePageState extends State<MyHomePage> {
             });
             break;
         }
-      } catch (_) {
-        // ignore
-      }
+      } catch (_) {}
     });
   }
 
   void _appendNanLog(String line) {
     setState(() {
       _nanLogs.add(line);
-      if (_nanLogs.length > 100) {
-        _nanLogs.removeAt(0);
-      }
+      if (_nanLogs.length > 100) _nanLogs.removeAt(0);
     });
+    // 同时打印到控制台，便于在 `flutter run` 的输出中查看
+    debugPrint('[NAN] $line');
+  }
+
+  void _appendDebug(String line) {
+    setState(() {
+      final ts = DateTime.now().toIso8601String();
+      _debugLogs.add('[$ts] $line');
+      if (_debugLogs.length > 200) _debugLogs.removeAt(0);
+    });
+    // 也打印到控制台，确保在运行 `flutter run` 时能看到
+    debugPrint('[DEBUG] $line');
+  }
+
+  Future<void> _copyDebugToClipboard() async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (_debugLogs.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('没有可复制的调试信息')));
+      return;
+    }
+    final text = _debugLogs.join('\n');
+    await Clipboard.setData(ClipboardData(text: text));
+    messenger.showSnackBar(const SnackBar(content: Text('调试信息已复制到剪贴板')));
+  }
+
+  Future<void> _copyNanLogsToClipboard() async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (_nanLogs.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('没有可复制的 NAN 日志')));
+      return;
+    }
+    final text = _nanLogs.join('\n');
+    await Clipboard.setData(ClipboardData(text: text));
+    messenger.showSnackBar(const SnackBar(content: Text('NAN 日志已复制到剪贴板')));
   }
 
   @override
   void dispose() {
     _nanSub?.cancel();
     _roomController.dispose();
+    _backendController.dispose();
     super.dispose();
   }
 
@@ -230,7 +259,6 @@ class _MyHomePageState extends State<MyHomePage> {
       }
       if (mounted) setState(() => _deviceId = id);
     } catch (_) {
-      // 忽略本地存储异常
       if (mounted) setState(() => _deviceId = 'unknown');
     }
   }
@@ -255,28 +283,85 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _applyRoomCode() async {
+    final messenger = ScaffoldMessenger.of(context);
     if (_nanStarting) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('正在启动中，请稍后再试')));
+      messenger.showSnackBar(const SnackBar(content: Text('正在启动中，请稍后再试')));
       return;
     }
     final raw = _roomController.text.trim();
     final valid = RegExp(r'^[A-Za-z0-9_-]{1,20}$');
     if (!valid.hasMatch(raw)) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('房间码仅支持英文/数字/下划线/短横线，长度1-20')));
+      messenger.showSnackBar(const SnackBar(content: Text('房间码仅支持英文/数字/下划线/短横线，长度1-20')));
       return;
     }
     try {
       final sp = await SharedPreferences.getInstance();
       await sp.setString('room_code', raw);
+      if (!mounted) return;
       setState(() => _roomCode = raw);
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('房间码已设置为 $raw')));
-      // 若已在运行，则重启使之生效
+      messenger.showSnackBar(SnackBar(content: Text('房间码已设置为 $raw')));
       if (_nanReady) {
         await _stopNan();
         await _startNan();
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('保存失败: $e')));
+      messenger.showSnackBar(SnackBar(content: Text('保存失败: $e')));
+    }
+  }
+
+  Future<void> _initBackendBaseUrl() async {
+    try {
+      final sp = await SharedPreferences.getInstance();
+      var saved = sp.getString('backend_base_url');
+      if (saved == null || saved.isEmpty) {
+        saved = 'http://192.168.0.90:8000';
+      }
+      _backendBaseUrl = saved;
+      _backendController.text = saved;
+      if (mounted) setState(() {});
+    } catch (_) {
+      _backendBaseUrl = 'http://192.168.0.90:8000';
+      _backendController.text = _backendBaseUrl!;
+    }
+  }
+
+  Future<void> _applyBackendUrl() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final raw = _backendController.text.trim();
+    final ok = Uri.tryParse(raw);
+    if (ok == null || !(ok.isScheme('http') || ok.isScheme('https'))) {
+      messenger.showSnackBar(const SnackBar(content: Text('请输入合法的 http(s) 地址')));
+      _appendDebug('后端地址非法：$raw');
+      return;
+    }
+    try {
+      final sp = await SharedPreferences.getInstance();
+      await sp.setString('backend_base_url', raw);
+      if (!mounted) return;
+      setState(() => _backendBaseUrl = raw);
+      messenger.showSnackBar(SnackBar(content: Text('后端地址已设置为 $raw')));
+      _appendDebug('后端地址已设置为 $raw');
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('保存失败: $e')));
+      _appendDebug('保存后端地址失败: $e');
+    }
+  }
+
+  Future<void> _testBackendHealth() async {
+    try {
+      final base = _backendBaseUrl ?? _backendController.text.trim();
+      if (base.isEmpty) throw Exception('后端地址未设置');
+      final uri = Uri.parse('$base/health');
+      final started = DateTime.now();
+      final resp = await http.get(uri).timeout(const Duration(seconds: 5));
+      final ms = DateTime.now().difference(started).inMilliseconds;
+      if (resp.statusCode == 200) {
+        _appendDebug('后端健康检查 OK ($ms ms)');
+      } else {
+        _appendDebug('后端返回 ${resp.statusCode}: ${resp.body}');
+      }
+    } catch (e) {
+      _appendDebug('健康检查失败: $e');
     }
   }
 
@@ -305,7 +390,7 @@ class _MyHomePageState extends State<MyHomePage> {
       count += b.length;
       buf.writeCharCode(r);
     }
-    return buf.toString() + '…';
+    return '$buf…';
   }
 
   String _wrapNanMessage({required String type, required String body}) {
@@ -338,18 +423,31 @@ class _MyHomePageState extends State<MyHomePage> {
     if (_isAnalyzing) return;
     setState(() {
       _isAnalyzing = true;
-      _resultText = null; // 清空上一条结果
+      _resultText = null;
     });
-    // 模拟调用后端 OCR
-    await Future.delayed(const Duration(milliseconds: 1200));
-    if (!mounted) return;
-    setState(() {
-      _isAnalyzing = false;
-      _resultText = 'OCR 识别结果\n'
-          '文本: "示例票据，金额￥128.00，日期2025-10-31"\n'
-          '置信度: 0.98\n'
-          '语言: zh-CN';
-    });
+    try {
+      final base = _backendBaseUrl;
+      if (base == null || base.isEmpty) throw Exception('后端地址未设置');
+      final uri = Uri.parse('$base/ocr');
+      final req = http.MultipartRequest('POST', uri)
+        ..fields['languages'] = 'ch_sim,en'
+        ..files.add(await http.MultipartFile.fromPath('file', _photo!.path));
+      final resp = await http.Response.fromStream(await req.send());
+      if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}: ${resp.body}');
+      final data = jsonDecode(resp.body);
+      final text = data['text']?.toString() ?? '';
+      final avgConf = data['avg_confidence'];
+      final langs = (data['languages'] as List?)?.join(',') ?? '';
+      if (!mounted) return;
+      setState(() {
+        _isAnalyzing = false;
+        _resultText = 'OCR 识别结果\n文本:\n$text\n\n平均置信度: ${avgConf ?? '-'}\n语言: $langs';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isAnalyzing = false);
+      _appendDebug('OCR 调用失败: $e');
+    }
   }
 
   Future<void> _analyzeWithVlm() async {
@@ -362,52 +460,67 @@ class _MyHomePageState extends State<MyHomePage> {
       _isAnalyzing = true;
       _resultText = null;
     });
-    // 模拟调用后端 VLM（多模态理解）
-    await Future.delayed(const Duration(milliseconds: 1500));
-    if (!mounted) return;
-    setState(() {
-      _isAnalyzing = false;
-      _resultText = 'VLM 分析结果\n'
-          '描述: "一张发票照片，抬头为示例公司，金额约128元，日期为2025年10月31日"\n'
-          '关键信息: {vendor: "示例公司", amount: 128.00, date: "2025-10-31"}';
-    });
+    try {
+      final base = _backendBaseUrl;
+      if (base == null || base.isEmpty) throw Exception('后端地址未设置');
+      final uri = Uri.parse('$base/vlm');
+      final req = http.MultipartRequest('POST', uri)
+        ..files.add(await http.MultipartFile.fromPath('file', _photo!.path));
+      final resp = await http.Response.fromStream(await req.send());
+      if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}: ${resp.body}');
+      final data = jsonDecode(resp.body);
+      final desc = data['description']?.toString() ?? '';
+      if (!mounted) return;
+      setState(() {
+        _isAnalyzing = false;
+        _resultText = 'VLM 分析结果\n描述: $desc';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isAnalyzing = false);
+      _appendDebug('VLM 调用失败: $e');
+    }
   }
 
-  // === NAN（附近直连）实验性调用 ===
   Future<void> _startNan() async {
+    final messenger = ScaffoldMessenger.of(context);
     try {
       if (_nanStarting || _nanReady) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('附近直连已在运行')));
+        messenger.showSnackBar(const SnackBar(content: Text('附近直连已在运行')));
         return;
       }
       setState(() => _nanStarting = true);
-      // 1) 申请必要权限（定位 + Android 13+ 附近 Wi‑Fi 设备）
       if (Platform.isAndroid) {
         final ok = await _ensureNanPermissions();
         if (!ok) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('缺少必要权限，无法启动附近直连')));
+          messenger.showSnackBar(const SnackBar(content: Text('缺少必要权限，无法启动附近直连')));
           setState(() => _nanStarting = false);
           return;
         }
       }
-
-      // 确保已有设备ID，用于 SSI 和消息信封
       if (_deviceId == null) {
         await _initDeviceId();
       }
-
       final bool available = await _nan.invokeMethod('isAvailable');
       if (!available) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('此设备/系统不支持 Wi‑Fi Aware')));
+        messenger.showSnackBar(const SnackBar(content: Text('此设备/系统不支持 Wi‑Fi Aware')));
         setState(() => _nanStarting = false);
         return;
       }
       final bool locOn = await _nan.invokeMethod('isLocationEnabled');
       if (!locOn) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先开启定位服务')));
-        // 继续 attach 也可能失败，这里仅提醒
+        messenger.showSnackBar(const SnackBar(content: Text('请先开启定位服务')));
       }
       await _nan.invokeMethod('attach');
+      if (Platform.isAndroid) {
+        try {
+          final int maxLen = await _nan.invokeMethod('getMaxMessageLength');
+          if (mounted) setState(() => _nanMaxMsgLen = maxLen > 0 ? maxLen : 1800);
+          _appendNanLog('maxMessageLen=$maxLen');
+        } catch (_) {
+          if (mounted) setState(() => _nanMaxMsgLen = 1800);
+        }
+      }
       await _nan.invokeMethod('publish', {
         'serviceName': 'aiocr_room',
         'ssi': 'room=${_roomCode ?? 'demo'};dev=${_deviceId ?? 'unknown'}',
@@ -417,65 +530,136 @@ class _MyHomePageState extends State<MyHomePage> {
         'serviceName': 'aiocr_room',
         'ssi': 'room=${_roomCode ?? 'demo'};dev=${_deviceId ?? 'unknown'}',
       });
+      if (!mounted) return;
       setState(() => _nanReady = true);
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('附近直连已启动（发布+订阅）')));
+      messenger.showSnackBar(const SnackBar(content: Text('附近直连已启动（发布+订阅）')));
     } on PlatformException catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('NAN 启动失败: ${e.message}')));
-    }
-    finally {
+      messenger.showSnackBar(SnackBar(content: Text('NAN 启动失败: ${e.message}')));
+    } finally {
       if (mounted) setState(() => _nanStarting = false);
     }
   }
 
   Future<void> _broadcastNan() async {
+    final messenger = ScaffoldMessenger.of(context);
     try {
-      final msg = _wrapNanMessage(type: 'text', body: 'hello from flutter');
-      await _nan.invokeMethod('broadcast', {'text': msg});
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已尝试广播 hello')));
+      final built = await _buildNanMessageRespectingLimit(type: 'text', body: 'hello from flutter');
+      await _nan.invokeMethod('broadcast', {'text': built.message});
+      if (built.truncated) _appendNanLog('消息已按上限截断后发送');
+      messenger.showSnackBar(const SnackBar(content: Text('已尝试广播 hello')));
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('广播失败: $e')));
+      messenger.showSnackBar(SnackBar(content: Text('广播失败: $e')));
     }
   }
 
   Future<void> _sendAnalysisOverNan() async {
+    final messenger = ScaffoldMessenger.of(context);
     if (!_nanReady) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先启动附近直连')));
+      messenger.showSnackBar(const SnackBar(content: Text('请先启动附近直连')));
       return;
     }
     final text = _resultText;
     if (text == null || text.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('没有可发送的分析结果')));
+      messenger.showSnackBar(const SnackBar(content: Text('没有可发送的分析结果')));
       return;
     }
-    // 构造 envelope，整体限制 ~900 字节
-    String payload = _truncateUtf8(text, 760); // 预留一些字节给 JSON 元数据
-    final msg = _wrapNanMessage(type: 'analysis', body: payload);
-    final msgTrimmed = _truncateUtf8(msg, 900);
     try {
-      await _nan.invokeMethod('broadcast', {'text': msgTrimmed});
-      _appendNanLog('broadcast analysis (${payload.length} chars)');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已通过 NAN 发送分析结果')));
-      }
+      final built = await _buildNanMessageRespectingLimit(type: 'analysis', body: text);
+      await _nan.invokeMethod('broadcast', {'text': built.message});
+      _appendNanLog('broadcast analysis (truncated=${built.truncated})');
+      if (mounted) messenger.showSnackBar(const SnackBar(content: Text('已通过 NAN 发送分析结果')));
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('发送失败: $e')));
-      }
+      if (mounted) messenger.showSnackBar(SnackBar(content: Text('发送失败: $e')));
     }
   }
 
+  Future<void> _rawBroadcastOversized() async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (!_nanReady) {
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(const SnackBar(behavior: SnackBarBehavior.fixed, content: Text('请先启动附近直连')));
+      return;
+    }
+    final body = 'A' * 2500;
+    final msg = _wrapNanMessage(type: 'text', body: body);
+    try {
+      await _nan.invokeMethod('broadcast', {'text': msg});
+      _appendNanLog('raw broadcast 2500B -> sent (may fail)');
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(const SnackBar(behavior: SnackBarBehavior.fixed, content: Text('已发送原始超长消息（观察结果）')));
+    } catch (e) {
+      _appendNanLog('raw broadcast error: $e');
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(SnackBar(behavior: SnackBarBehavior.fixed, content: Text('发送失败: $e')));
+    }
+  }
+
+  Future<void> _safeBroadcastOversized() async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (!_nanReady) {
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(const SnackBar(behavior: SnackBarBehavior.fixed, content: Text('请先启动附近直连')));
+      return;
+    }
+    final body = 'A' * 2500;
+    final built = await _buildNanMessageRespectingLimit(type: 'text', body: body);
+    try {
+      await _nan.invokeMethod('broadcast', {'text': built.message});
+      _appendNanLog('safe broadcast 2500B -> truncated=${built.truncated}');
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(const SnackBar(behavior: SnackBarBehavior.fixed, content: Text('已通过安全构建发送（可能已截断）')));
+    } catch (e) {
+      _appendNanLog('safe broadcast error: $e');
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(SnackBar(behavior: SnackBarBehavior.fixed, content: Text('发送失败: $e')));
+    }
+  }
+
+  Future<int> _ensureNanMaxMessageLen() async {
+    if (_nanMaxMsgLen != null) return _nanMaxMsgLen!;
+    if (!Platform.isAndroid) return 900;
+    try {
+      final int v = await _nan.invokeMethod('getMaxMessageLength');
+      _nanMaxMsgLen = v > 0 ? v : 1800;
+      return _nanMaxMsgLen!;
+    } catch (_) {
+      _nanMaxMsgLen = 1800;
+      return _nanMaxMsgLen!;
+    }
+  }
+
+  Future<_BuiltMsg> _buildNanMessageRespectingLimit({required String type, required String body}) async {
+    final maxLen = await _ensureNanMaxMessageLen();
+    String candidate = _wrapNanMessage(type: type, body: body);
+    List<int> bytes = utf8.encode(candidate);
+    if (bytes.length <= maxLen) return _BuiltMsg(candidate, false);
+    int low = 0;
+    int high = utf8.encode(body).length;
+    String best = candidate;
+    bool truncated = false;
+    while (low <= high) {
+      final mid = (low + high) >> 1;
+      final testBody = _truncateUtf8(body, mid);
+      final testMsg = _wrapNanMessage(type: type, body: testBody);
+      final len = utf8.encode(testMsg).length;
+      if (len <= maxLen) {
+        truncated = mid < utf8.encode(body).length;
+        best = testMsg;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return _BuiltMsg(best, truncated);
+  }
+
   Future<bool> _ensureNanPermissions() async {
-    // 定位权限
     final loc = await Permission.locationWhenInUse.request();
-    // Android 13+ 附近 Wi‑Fi 设备
     PermissionStatus nearbyStatus = PermissionStatus.granted;
     try {
       nearbyStatus = await Permission.nearbyWifiDevices.request();
-    } catch (_) {
-      // 在低版本上此权限不可用，忽略
-    }
+    } catch (_) {}
     final granted = (loc.isGranted || loc.isLimited) && (nearbyStatus.isGranted || nearbyStatus.isLimited || nearbyStatus.isDenied);
-    // 注意：nearby 在低版本可能返回 denied，不影响旧系统
     if (!granted) {
       if (loc.isPermanentlyDenied || nearbyStatus.isPermanentlyDenied) {
         await openAppSettings();
@@ -498,7 +682,6 @@ class _MyHomePageState extends State<MyHomePage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // 房间码设置
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(12),
@@ -509,8 +692,7 @@ class _MyHomePageState extends State<MyHomePage> {
                         children: [
                           Text('房间码', style: Theme.of(context).textTheme.titleMedium),
                           const SizedBox(width: 8),
-                          if (_roomCode != null)
-                            Chip(label: Text(_roomCode!)),
+                          if (_roomCode != null) Chip(label: Text(_roomCode!)),
                           const Spacer(),
                           TextButton(
                             onPressed: _nanReady || _nanStarting ? _stopNan : null,
@@ -534,7 +716,7 @@ class _MyHomePageState extends State<MyHomePage> {
                           FilledButton(
                             onPressed: _applyRoomCode,
                             child: const Text('应用房间码'),
-                          )
+                          ),
                         ],
                       ),
                     ],
@@ -542,10 +724,43 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
               ),
               const SizedBox(height: 12),
-              Text(
-                '预览区',
-                style: Theme.of(context).textTheme.titleMedium,
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          Text('后端地址', style: Theme.of(context).textTheme.titleMedium),
+                          const SizedBox(width: 8),
+                          if (_backendBaseUrl != null) Chip(label: Text(_backendBaseUrl!, overflow: TextOverflow.ellipsis)),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _backendController,
+                              decoration: const InputDecoration(
+                                border: OutlineInputBorder(),
+                                hintText: '如 http://192.168.0.90:8000（真机访问局域网）',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          FilledButton(onPressed: _applyBackendUrl, child: const Text('应用地址')),
+                          const SizedBox(width: 8),
+                          OutlinedButton(onPressed: _testBackendHealth, child: const Text('测试连接')),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
               ),
+              const SizedBox(height: 12),
+              Text('预览区', style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 8),
               SizedBox(
                 height: 260,
@@ -553,18 +768,10 @@ class _MyHomePageState extends State<MyHomePage> {
                   aspectRatio: 4 / 3,
                   child: Card(
                     child: _photo == null
-                        ? const Center(
-                            child: Text(
-                              '还没有照片，点击下方“拍照”开始',
-                              style: TextStyle(color: Colors.black54),
-                            ),
-                          )
+                        ? const Center(child: Text('还没有照片，点击下方“拍照”开始', style: TextStyle(color: Colors.black54)))
                         : ClipRRect(
                             borderRadius: BorderRadius.circular(12),
-                            child: Image.file(
-                              File(_photo!.path),
-                              fit: BoxFit.cover,
-                            ),
+                            child: Image.file(File(_photo!.path), fit: BoxFit.cover),
                           ),
                   ),
                 ),
@@ -573,14 +780,10 @@ class _MyHomePageState extends State<MyHomePage> {
               FilledButton.icon(
                 onPressed: () async {
                   final result = await Navigator.of(context).push<XFile>(
-                    MaterialPageRoute(
-                      builder: (_) => const CameraCapturePage(),
-                    ),
+                    MaterialPageRoute(builder: (_) => const CameraCapturePage()),
                   );
                   if (!mounted) return;
-                  if (result != null) {
-                    setState(() => _photo = result);
-                  }
+                  if (result != null) setState(() => _photo = result);
                 },
                 icon: const Icon(Icons.photo_camera),
                 label: const Text('拍照'),
@@ -637,6 +840,15 @@ class _MyHomePageState extends State<MyHomePage> {
                 ],
               ),
               const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton(onPressed: _nanReady ? _rawBroadcastOversized : null, child: const Text('测试：直接发送 2500B（绕过截断）')),
+                  OutlinedButton(onPressed: _nanReady ? _safeBroadcastOversized : null, child: const Text('测试：通过安全构建发送 2500B（会截断）')),
+                ],
+              ),
+              const SizedBox(height: 8),
               Align(
                 alignment: Alignment.centerRight,
                 child: FilledButton.tonalIcon(
@@ -646,7 +858,6 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
               ),
               const SizedBox(height: 12),
-              // 分析结果区域
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(12),
@@ -659,9 +870,7 @@ class _MyHomePageState extends State<MyHomePage> {
                           Text('分析结果', style: Theme.of(context).textTheme.titleMedium),
                           const Spacer(),
                           TextButton(
-                            onPressed: _resultText == null && !_isAnalyzing
-                                ? null
-                                : () => setState(() => _resultText = null),
+                            onPressed: _resultText == null && !_isAnalyzing ? null : () => setState(() => _resultText = null),
                             child: const Text('清空'),
                           ),
                         ],
@@ -673,19 +882,47 @@ class _MyHomePageState extends State<MyHomePage> {
                             ? const Center(child: CircularProgressIndicator())
                             : (_resultText == null
                                 ? const Center(child: Text('暂无分析结果'))
-                                : SingleChildScrollView(
-                                    child: Text(
-                                      _resultText!,
-                                      style: const TextStyle(height: 1.4),
-                                    ),
-                                  )),
+                                : SingleChildScrollView(child: Text(_resultText!, style: const TextStyle(height: 1.4)))),
                       ),
                     ],
                   ),
                 ),
               ),
               const SizedBox(height: 12),
-              // NAN 日志区域（固定高度，避免在可滚动页面中使用 Expanded）
+              SizedBox(
+                height: 200,
+                child: Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Text('错误/调试信息', style: Theme.of(context).textTheme.titleMedium),
+                            const Spacer(),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                TextButton(onPressed: _debugLogs.isEmpty ? null : () => setState(() => _debugLogs.clear()), child: const Text('清空')),
+                                const SizedBox(width: 8),
+                                TextButton(onPressed: _debugLogs.isEmpty ? null : _copyDebugToClipboard, child: const Text('复制')),
+                              ],
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Expanded(
+                          child: _debugLogs.isEmpty
+                              ? const Center(child: Text('暂无错误/调试信息'))
+                              : ListView.builder(itemCount: _debugLogs.length, itemBuilder: (context, i) => Text(_debugLogs[i])),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
               SizedBox(
                 height: 240,
                 child: Card(
@@ -698,9 +935,13 @@ class _MyHomePageState extends State<MyHomePage> {
                           children: [
                             Text('NAN 日志', style: Theme.of(context).textTheme.titleMedium),
                             const Spacer(),
-                            TextButton(
-                              onPressed: _nanLogs.isEmpty ? null : () => setState(() => _nanLogs.clear()),
-                              child: const Text('清空'),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                TextButton(onPressed: _nanLogs.isEmpty ? null : () => setState(() => _nanLogs.clear()), child: const Text('清空')),
+                                const SizedBox(width: 8),
+                                TextButton(onPressed: _nanLogs.isEmpty ? null : _copyNanLogsToClipboard, child: const Text('复制')),
+                              ],
                             ),
                           ],
                         ),
@@ -708,10 +949,7 @@ class _MyHomePageState extends State<MyHomePage> {
                         Expanded(
                           child: _nanLogs.isEmpty
                               ? const Center(child: Text('暂无 NAN 日志'))
-                              : ListView.builder(
-                                  itemCount: _nanLogs.length,
-                                  itemBuilder: (context, i) => Text(_nanLogs[i]),
-                                ),
+                              : ListView.builder(itemCount: _nanLogs.length, itemBuilder: (context, i) => Text(_nanLogs[i])),
                         ),
                       ],
                     ),
@@ -725,3 +963,4 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 }
+ 
