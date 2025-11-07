@@ -13,6 +13,7 @@ Run locally:
 from __future__ import annotations
 
 import io
+import json
 import os
 import base64
 import time
@@ -23,11 +24,22 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
 import httpx
+import logging
+import traceback
 
 from PIL import Image
 
 load_dotenv()
 app = FastAPI(title="AI OCR Read Backend", version="0.1.0")
+
+# logging: enable verbose VLM logs when VLM_DEBUG env var is truthy
+logger = logging.getLogger("ocr_ai_backend")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(h)
+vlm_debug = os.getenv("VLM_DEBUG", "0").lower() in ("1", "true", "yes")
+logger.setLevel(logging.DEBUG if vlm_debug else logging.INFO)
 
 
 # Lazy holders so cold-start happens on first call only
@@ -81,6 +93,12 @@ def _get_vlm_config():
         "timeout": float(os.getenv("VLM_API_TIMEOUT", "30")),
         # 额外 JSON 字段（可选），逗号分隔的 key=value 对，例如: extra=1,lang=zh
         "extra_fields": os.getenv("VLM_API_EXTRA_FIELDS", ""),
+        # Chat-completions 风格（如 SiliconFlow/OpenAI 兼容）
+        "chat": os.getenv("VLM_API_CHAT", "0").lower() in ("1", "true", "yes"),
+        "prompt": os.getenv("VLM_API_PROMPT", "Please describe the image concisely."),
+        "max_tokens": int(os.getenv("VLM_API_MAX_TOKENS", "512")),
+        "temperature": float(os.getenv("VLM_API_TEMPERATURE", "0.7")),
+        "top_p": float(os.getenv("VLM_API_TOP_P", "0.7")),
     }
 
 
@@ -144,82 +162,154 @@ async def ocr_endpoint(
 
 @app.post("/vlm")
 async def vlm_endpoint(file: UploadFile = File(...)):
+    """
+    VLM endpoint: 调用远程 VLM API 识别图像内容
+    接受 multipart/form-data 格式的图片文件
+    """
     started = time.perf_counter()
+    
+    # 读取图片并转换为 base64
     try:
         content = await file.read()
-        # 读取一次用于校验（也可省略）
-        Image.open(io.BytesIO(content)).convert("RGB")
-    except Exception:
-        raise HTTPException(status_code=400, detail="无法读取图片文件")
-
-    cfg = _get_vlm_config()
-    headers = {}
-    if cfg["api_key"]:
-        headers[cfg["auth_header"]] = f"{cfg['key_prefix']}{cfg['api_key']}" if cfg["key_prefix"] else cfg["api_key"]
-
-    timeout = httpx.Timeout(cfg["timeout"])
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            if cfg["mode"].lower() == "base64":
-                b64 = base64.b64encode(content).decode("utf-8")
-                payload = {cfg["image_field"]: b64}
-                if cfg["model"]:
-                    payload["model"] = cfg["model"]
-                # 附加字段
-                if cfg["extra_fields"]:
-                    for kv in cfg["extra_fields"].split(","):
-                        kv = kv.strip()
-                        if not kv:
-                            continue
-                        if "=" in kv:
-                            k, v = kv.split("=", 1)
-                            payload[k.strip()] = v.strip()
-                resp = await client.post(cfg["url"], json=payload, headers=headers)
-            else:
-                # multipart
-                files = {
-                    cfg["image_field"]: (file.filename or "image.jpg", content, file.content_type or "image/jpeg"),
+        image = Image.open(io.BytesIO(content)).convert("RGB")
+        
+        # 优化图片大小以减少传输时间
+        # 如果图片过大,等比例缩放到最大边不超过 1920px
+        max_size = 1920
+        if max(image.size) > max_size:
+            ratio = max_size / max(image.size)
+            new_size = tuple(int(dim * ratio) for dim in image.size)
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+            logger.debug(f"图片已缩放至: {new_size}")
+        
+        # 将图片转换为 base64 编码,使用 JPEG 格式以减小大小
+        buffered = io.BytesIO()
+        image.save(buffered, format="JPEG", quality=85, optimize=True)
+        img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        img_data_uri = f"data:image/jpeg;base64,{img_base64}"
+        
+        img_size_kb = len(img_base64) / 1024
+        logger.debug(f"图片 base64 大小: {img_size_kb:.2f} KB")
+    except Exception as e:
+        logger.error(f"无法读取图片文件: {e}")
+        raise HTTPException(status_code=400, detail=f"无法读取图片文件: {e}")
+    
+    # 获取 VLM 配置
+    config = _get_vlm_config()
+    
+    # 构建请求数据 - 使用 chat completions 格式
+    headers = {
+        "Content-Type": "application/json",
+    }
+    
+    # 添加认证头
+    if config["api_key"]:
+        auth_header = config["auth_header"]
+        key_prefix = config["key_prefix"]
+        headers[auth_header] = f"{key_prefix}{config['api_key']}"
+    
+    # 构建消息内容 - 包含图片和提示词
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": img_data_uri
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": config["prompt"]
                 }
-                data = {}
-                if cfg["model"]:
-                    data["model"] = cfg["model"]
-                if cfg["extra_fields"]:
-                    for kv in cfg["extra_fields"].split(","):
-                        kv = kv.strip()
-                        if not kv:
-                            continue
-                        if "=" in kv:
-                            k, v = kv.split("=", 1)
-                            data[k.strip()] = v.strip()
-                resp = await client.post(cfg["url"], data=data, files=files, headers=headers)
-
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"上游 VLM API 错误 {resp.status_code}: {resp.text[:200]}")
-        try:
-            body = resp.json()
-        except Exception:
-            raise HTTPException(status_code=502, detail=f"上游返回非 JSON：{resp.text[:200]}")
-
-        desc = None
-        # 优先使用配置的 key
-        if isinstance(body, dict) and cfg["desc_key"] in body:
-            desc = body.get(cfg["desc_key"])  # type: ignore
-        # 常见兜底
-        if not desc and isinstance(body, dict):
-            for k in ("description", "generated_text", "caption", "text"):
-                if k in body and isinstance(body[k], str):
-                    desc = body[k]
-                    break
-        if not desc:
-            # 无法解析时返回片段，便于调试
-            raise HTTPException(status_code=502, detail=f"无法从上游响应中解析描述：{str(body)[:300]}")
-
+            ]
+        }
+    ]
+    
+    payload = {
+        "model": config["model"],
+        "messages": messages,
+        "stream": False,
+        "max_tokens": config["max_tokens"],
+        "temperature": config["temperature"],
+        "top_p": config["top_p"],
+    }
+    
+    logger.debug(f"VLM 请求 URL: {config['url']}")
+    logger.debug(f"VLM 请求模型: {config['model']}")
+    logger.debug(f"VLM 请求提示词: {config['prompt']}")
+    
+    # 调用远程 API
+    try:
+        # 使用更长的超时时间,分别设置连接和读取超时
+        timeout = httpx.Timeout(
+            connect=10.0,  # 连接超时 10 秒
+            read=config["timeout"],  # 读取超时使用配置值
+            write=10.0,  # 写入超时 10 秒
+            pool=5.0  # 连接池超时 5 秒
+        )
+        
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            logger.debug(f"开始调用 VLM API (超时: {config['timeout']}s)...")
+            response = await client.post(
+                config["url"],
+                headers=headers,
+                json=payload
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+        logger.debug(f"VLM API 响应: {json.dumps(result, ensure_ascii=False, indent=2)}")
+        
+        # 从响应中提取描述文本
+        # SiliconFlow/OpenAI 格式: choices[0].message.content
+        description = ""
+        if "choices" in result and len(result["choices"]) > 0:
+            choice = result["choices"][0]
+            if "message" in choice and "content" in choice["message"]:
+                description = choice["message"]["content"]
+        
+        if not description:
+            logger.warning(f"无法从响应中提取描述: {result}")
+            description = str(result)
+        
         duration_ms = int((time.perf_counter() - started) * 1000)
-        return JSONResponse({"description": str(desc), "duration_ms": duration_ms})
-    except HTTPException:
-        raise
-    except Exception as e:  # pragma: no cover
-        raise HTTPException(status_code=502, detail=f"调用上游 VLM 失败: {e}")
+        
+        return JSONResponse({
+            "description": description,
+            "duration_ms": duration_ms,
+            "model": config["model"]
+        })
+        
+    except httpx.TimeoutException as e:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        logger.error(f"VLM API 调用超时 ({duration_ms}ms): {e}")
+        raise HTTPException(
+            status_code=504,
+            detail=f"VLM API 调用超时,请尝试增加 VLM_API_TIMEOUT 配置值 (当前: {config['timeout']}s)"
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"VLM API 返回错误状态码: {e.response.status_code}")
+        logger.error(f"响应内容: {e.response.text}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"VLM API 返回错误: {e.response.text}"
+        )
+    except httpx.HTTPError as e:
+        logger.error(f"VLM API 调用失败: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=503,
+            detail=f"VLM API 调用失败: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"VLM 处理失败: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"VLM 处理失败: {str(e)}"
+        )
 
 
 def run():  # console script entrypoint

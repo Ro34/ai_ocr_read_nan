@@ -74,7 +74,47 @@ cp .env.example .env
 - `VLM_API_TIMEOUT`（默认 `30`）：请求超时秒数
 - `VLM_API_EXTRA_FIELDS`（可选）：以逗号分隔的 `key=value`，会一并提交给上游
 
+- `VLM_API_TEMPERATURE`（可选，默认 0.7）：Chat-completions 采样温度
+- `VLM_API_TOP_P`（可选，默认 0.7）：Chat-completions top_p 截断采样
+
+### SiliconFlow（Chat Completions）快速配置
+
+SiliconFlow 提供 OpenAI 兼容的 `/v1/chat/completions` 接口，支持图文混合输入。后端已内置适配：
+
+1) `.env` 示例：
+
+```env
+VLM_API_URL=https://api.siliconflow.cn/v1/chat/completions
+VLM_API_KEY=sk-xxxx
+VLM_API_CHAT=1
+VLM_API_MODEL=Qwen/Qwen3-VL-30B-A3B-Instruct
+VLM_API_PROMPT=用中文简洁描述这张图片的内容
+VLM_API_MAX_TOKENS=256
+```
+
+2) 工作方式：当 `VLM_API_CHAT=1`（或 URL 含 `/chat/completions`）时，后端会发送如下 JSON 结构给上游（示意）：
+
+```jsonc
+{
+	"model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+	"messages": [
+		{
+			"role": "user",
+			"content": [
+				{"type": "text", "text": "用中文简洁描述这张图片的内容"},
+				{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,<...>"}}
+			]
+		}
+	],
+	"stream": false,
+	"max_tokens": 256
+}
+```
+
+响应解析优先从 `choices[0].message.content` 读取描述文本；若没有，则会回退到 `description/generated_text/caption/text` 等常见字段。
+
 后端在启动时会自动读取 `.env`。当调用 `/vlm` 时，后端会将上传的图片按 `VLM_API_MODE` 指定的方式（`multipart` 或 `base64`）转发给外部 API，并从响应中按 `VLM_API_DESC_KEY` 提取图片描述。
+若启用了 `VLM_API_CHAT`，则走上面的 Chat Completions 适配逻辑。
 
 ## 常见问题
 

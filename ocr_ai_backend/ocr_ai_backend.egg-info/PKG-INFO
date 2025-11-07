@@ -13,13 +13,16 @@ Requires-Dist: torch>=2.1.0; platform_machine != "i386"
 Requires-Dist: torchvision>=0.16.0; platform_machine != "i386"
 Requires-Dist: transformers>=4.44.0
 Requires-Dist: huggingface-hub>=0.23.0
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: numpy>=1.26.0
 
 # AI OCR Backend
 
 FastAPI 服务，提供：
 
 - POST `/ocr`：使用 EasyOCR 对图片进行文字识别
-- POST `/vlm`：使用 Transformers 图像描述模型（image-to-text）生成图片描述
+- POST `/vlm`：调用“在线 VLM API”生成图片描述（可通过 `.env` 配置）
 
 返回示例：
 
@@ -57,7 +60,7 @@ uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 然后打开 http://127.0.0.1:8000/docs 查看接口文档（真机请访问你的主机 IP，如 http://192.168.0.90:8000/docs）。
 
-提示：第一次调用时会懒加载模型，可能稍慢。若安装 `torch/torchvision` 失败，请单独安装与你平台对应的轮子（参考 https://pytorch.org/ ）。
+提示：`/ocr` 使用 EasyOCR（需要 `torch/torchvision`）；`/vlm` 现已改为调用在线 API，无需本地下载大模型。
 
 ## 接口参数
 
@@ -68,6 +71,30 @@ uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - `POST /vlm`
 	- form-data: `file`（必填，图片）
 
+## 配置在线 VLM（.env）
+
+复制示例文件并填写你的线上接口信息：
+
+```bash
+cd ocr_ai_backend
+cp .env.example .env
+```
+
+`.env` 关键项：
+
+- `VLM_API_URL`（必填）：你的在线 VLM 接口地址
+- `VLM_API_KEY`（可选）：API Key
+- `VLM_API_AUTH_HEADER`（默认 `Authorization`）：鉴权使用的请求头名
+- `VLM_API_KEY_PREFIX`（默认 `Bearer `）：鉴权前缀
+- `VLM_API_MODE`（默认 `multipart`）：`multipart` 或 `base64`
+- `VLM_API_IMAGE_FIELD`（默认 `file`）：图片字段名
+- `VLM_API_DESC_KEY`（默认 `description`）：响应 JSON 中描述字段名
+- `VLM_API_MODEL`（可选）：指定上游模型名
+- `VLM_API_TIMEOUT`（默认 `30`）：请求超时秒数
+- `VLM_API_EXTRA_FIELDS`（可选）：以逗号分隔的 `key=value`，会一并提交给上游
+
+后端在启动时会自动读取 `.env`。当调用 `/vlm` 时，后端会将上传的图片按 `VLM_API_MODE` 指定的方式（`multipart` 或 `base64`）转发给外部 API，并从响应中按 `VLM_API_DESC_KEY` 提取图片描述。
+
 ## 常见问题
 
 - iOS/Android 调试访问本机/局域网：
@@ -76,4 +103,5 @@ uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
 	- 真机需使用你电脑的局域网 IP（例如 `http://192.168.0.90:8000`），并确保同一网络下可访问
 
 - iOS ATS/Android 明文 HTTP 限制：开发阶段如需 HTTP，可配置 ATS 例外或 Android 网络安全配置（生产环境建议使用 HTTPS）。
+
 

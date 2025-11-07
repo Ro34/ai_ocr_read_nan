@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'camera_capture_page.dart';
+import 'settings_page.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -328,40 +329,157 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> _applyBackendUrl() async {
     final messenger = ScaffoldMessenger.of(context);
     final raw = _backendController.text.trim();
-    final ok = Uri.tryParse(raw);
-    if (ok == null || !(ok.isScheme('http') || ok.isScheme('https'))) {
-      messenger.showSnackBar(const SnackBar(content: Text('请输入合法的 http(s) 地址')));
-      _appendDebug('后端地址非法：$raw');
+    
+    if (raw.isEmpty) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Row(
+            children: [
+              Icon(Icons.warning, color: Colors.white),
+              SizedBox(width: 12),
+              Text('请输入后端地址'),
+            ],
+          ),
+          backgroundColor: Colors.orange,
+        ),
+      );
       return;
     }
+    
+    final ok = Uri.tryParse(raw);
+    if (ok == null || !(ok.isScheme('http') || ok.isScheme('https'))) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Row(
+            children: [
+              Icon(Icons.error, color: Colors.white),
+              SizedBox(width: 12),
+              Expanded(child: Text('请输入合法的 http:// 或 https:// 地址')),
+            ],
+          ),
+          backgroundColor: Colors.red,
+        ),
+      );
+      _appendDebug('❌ 后端地址非法：$raw');
+      return;
+    }
+    
     try {
       final sp = await SharedPreferences.getInstance();
       await sp.setString('backend_base_url', raw);
       if (!mounted) return;
       setState(() => _backendBaseUrl = raw);
-      messenger.showSnackBar(SnackBar(content: Text('后端地址已设置为 $raw')));
-      _appendDebug('后端地址已设置为 $raw');
+      
+      messenger.showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.check_circle, color: Colors.white),
+              const SizedBox(width: 12),
+              Expanded(child: Text('已保存: $raw')),
+            ],
+          ),
+          backgroundColor: Colors.green,
+          action: SnackBarAction(
+            label: '测试',
+            textColor: Colors.white,
+            onPressed: _testBackendHealth,
+          ),
+        ),
+      );
+      _appendDebug('✅ 后端地址已设置为 $raw');
     } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('保存失败: $e')));
-      _appendDebug('保存后端地址失败: $e');
+      messenger.showSnackBar(SnackBar(
+        content: Text('保存失败: $e'),
+        backgroundColor: Colors.red,
+      ));
+      _appendDebug('❌ 保存后端地址失败: $e');
     }
   }
 
   Future<void> _testBackendHealth() async {
+    final messenger = ScaffoldMessenger.of(context);
+    
+    // 显示测试中的提示
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Row(
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+            ),
+            SizedBox(width: 12),
+            Text('正在测试后端连接...'),
+          ],
+        ),
+        duration: Duration(seconds: 10),
+      ),
+    );
+    
     try {
       final base = _backendBaseUrl ?? _backendController.text.trim();
       if (base.isEmpty) throw Exception('后端地址未设置');
+      
       final uri = Uri.parse('$base/health');
       final started = DateTime.now();
       final resp = await http.get(uri).timeout(const Duration(seconds: 5));
       final ms = DateTime.now().difference(started).inMilliseconds;
+      
+      messenger.hideCurrentSnackBar();
+      
       if (resp.statusCode == 200) {
-        _appendDebug('后端健康检查 OK ($ms ms)');
+        _appendDebug('✅ 后端健康检查 OK ($ms ms)');
+        messenger.showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.check_circle, color: Colors.white),
+                const SizedBox(width: 12),
+                Text('连接成功! 响应时间: $ms ms'),
+              ],
+            ),
+            backgroundColor: Colors.green,
+            duration: const Duration(seconds: 3),
+          ),
+        );
       } else {
-        _appendDebug('后端返回 ${resp.statusCode}: ${resp.body}');
+        _appendDebug('❌ 后端返回 ${resp.statusCode}: ${resp.body}');
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text('连接失败: HTTP ${resp.statusCode}'),
+            backgroundColor: Colors.orange,
+          ),
+        );
       }
     } catch (e) {
-      _appendDebug('健康检查失败: $e');
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.hideCurrentSnackBar();
+      
+      String errorMsg = '连接失败';
+      if (e.toString().contains('Failed host lookup') || e.toString().contains('SocketException')) {
+        errorMsg = '无法连接到服务器,请检查地址和网络';
+      } else if (e.toString().contains('TimeoutException')) {
+        errorMsg = '连接超时,请检查服务器是否运行';
+      } else if (e.toString().contains('未设置')) {
+        errorMsg = '请先输入后端地址';
+      }
+      
+      _appendDebug('❌ 健康检查失败: $e');
+      messenger.showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.error, color: Colors.white),
+              const SizedBox(width: 12),
+              Expanded(child: Text(errorMsg)),
+            ],
+          ),
+          backgroundColor: Colors.red,
+          duration: const Duration(seconds: 4),
+        ),
+      );
     }
   }
 
@@ -674,6 +792,19 @@ class _MyHomePageState extends State<MyHomePage> {
       appBar: AppBar(
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         title: Text(widget.title),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: '后端 API 设置',
+            onPressed: () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const SettingsPage()),
+              );
+              // 返回后重新加载后端地址
+              await _initBackendBaseUrl();
+            },
+          ),
+        ],
       ),
       body: SafeArea(
         bottom: true,
@@ -732,27 +863,79 @@ class _MyHomePageState extends State<MyHomePage> {
                     children: [
                       Row(
                         children: [
-                          Text('后端地址', style: Theme.of(context).textTheme.titleMedium),
+                          Icon(Icons.cloud, size: 20, color: Theme.of(context).colorScheme.primary),
                           const SizedBox(width: 8),
-                          if (_backendBaseUrl != null) Chip(label: Text(_backendBaseUrl!, overflow: TextOverflow.ellipsis)),
+                          Text('后端 API 地址', style: Theme.of(context).textTheme.titleMedium),
+                          const SizedBox(width: 8),
+                          if (_backendBaseUrl != null) 
+                            Flexible(
+                              child: Chip(
+                                label: Text(_backendBaseUrl!, overflow: TextOverflow.ellipsis),
+                                backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                              ),
+                            ),
                         ],
                       ),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _backendController,
+                        decoration: InputDecoration(
+                          border: const OutlineInputBorder(),
+                          labelText: '后端 URL',
+                          hintText: 'http://192.168.0.90:8000',
+                          helperText: '真机访问电脑局域网 IP + 端口',
+                          helperMaxLines: 2,
+                          prefixIcon: const Icon(Icons.link),
+                          suffixIcon: _backendController.text.isNotEmpty
+                              ? IconButton(
+                                  icon: const Icon(Icons.clear),
+                                  onPressed: () => setState(() => _backendController.clear()),
+                                )
+                              : null,
+                        ),
+                        keyboardType: TextInputType.url,
+                        onChanged: (_) => setState(() {}),
+                      ),
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          ActionChip(
+                            avatar: const Icon(Icons.computer, size: 18),
+                            label: const Text('本机'),
+                            onPressed: () => setState(() => _backendController.text = 'http://localhost:8000'),
+                          ),
+                          ActionChip(
+                            avatar: const Icon(Icons.router, size: 18),
+                            label: const Text('局域网'),
+                            onPressed: () => setState(() => _backendController.text = 'http://192.168.0.90:8000'),
+                          ),
+                          ActionChip(
+                            avatar: const Icon(Icons.wifi, size: 18),
+                            label: const Text('WiFi'),
+                            onPressed: () => setState(() => _backendController.text = 'http://10.0.0.10:8000'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
                       Row(
                         children: [
                           Expanded(
-                            child: TextField(
-                              controller: _backendController,
-                              decoration: const InputDecoration(
-                                border: OutlineInputBorder(),
-                                hintText: '如 http://192.168.0.90:8000（真机访问局域网）',
-                              ),
+                            child: FilledButton.icon(
+                              onPressed: _applyBackendUrl,
+                              icon: const Icon(Icons.save),
+                              label: const Text('保存'),
                             ),
                           ),
                           const SizedBox(width: 8),
-                          FilledButton(onPressed: _applyBackendUrl, child: const Text('应用地址')),
-                          const SizedBox(width: 8),
-                          OutlinedButton(onPressed: _testBackendHealth, child: const Text('测试连接')),
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: _testBackendHealth,
+                              icon: const Icon(Icons.health_and_safety),
+                              label: const Text('测试连接'),
+                            ),
+                          ),
                         ],
                       ),
                     ],
