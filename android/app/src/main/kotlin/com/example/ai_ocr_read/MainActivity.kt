@@ -101,6 +101,65 @@ class MainActivity : FlutterActivity() {
 					nan?.release()
 					result.success(true)
 				}
+				// === Data Path 相关方法 ===
+				"listDataPathPeers" -> {
+					if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+						result.error("unsupported", "Data path requires Android 10+", null)
+					} else {
+						val peers = nan?.listDataPathPeers() ?: emptyList()
+						result.success(peers)
+					}
+				}
+				"openDataPath" -> {
+					if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+						result.error("unsupported", "Data path requires Android 10+", null)
+					} else {
+						val peerId = call.argument<Int>("peerId")
+						val passphrase = call.argument<String>("passphrase")
+						if (peerId == null) {
+							result.error("bad_args", "peerId is required", null)
+							return@setMethodCallHandler
+						}
+						if (nan == null) nan = NanManager(this)
+						nan!!.openDataPath(
+							peerId = peerId,
+							passphrase = passphrase,
+							onSuccess = { result.success(true) },
+							onError = { err -> result.error("open_data_path", err, null) }
+						)
+					}
+				}
+				"sendLargeText" -> {
+					if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+						result.error("unsupported", "Data path requires Android 10+", null)
+					} else {
+						val peerId = call.argument<Int>("peerId")
+						val text = call.argument<String>("text")
+						if (peerId == null || text == null) {
+							result.error("bad_args", "peerId and text are required", null)
+							return@setMethodCallHandler
+						}
+						nan?.sendLargeText(
+							peerId = peerId,
+							text = text,
+							onSuccess = { result.success(true) },
+							onError = { err -> result.error("send_large_text", err, null) }
+						)
+					}
+				}
+				"closeDataPath" -> {
+					if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+						result.error("unsupported", "Data path requires Android 10+", null)
+					} else {
+						val peerId = call.argument<Int>("peerId")
+						if (peerId == null) {
+							result.error("bad_args", "peerId is required", null)
+							return@setMethodCallHandler
+						}
+						nan?.closeDataPath(peerId)
+						result.success(true)
+					}
+				}
 				else -> result.notImplemented()
 			}
 		}

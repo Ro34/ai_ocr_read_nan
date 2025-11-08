@@ -30,6 +30,15 @@ class NanManager(private val context: Context) {
     private var session: WifiAwareSession? = null
     private var pub: PublishDiscoverySession? = null
     private var sub: SubscribeDiscoverySession? = null
+    
+    // 数据路径管理器（API 29+）
+    private var dataPathManager: DataPathManager? = null
+    
+    init {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            dataPathManager = DataPathManager(context)
+        }
+    }
     // 区分不同会话来源的 peer handle，便于使用正确的会话发送消息
     private val subPeers = mutableSetOf<PeerHandle>()
     private val pubPeers = mutableSetOf<PeerHandle>()
@@ -39,11 +48,16 @@ class NanManager(private val context: Context) {
     private val pubIdToPeer = mutableMapOf<String, PeerHandle>()
     // 记录已握手过的设备，避免重复发送握手消息
     private val handshakedIds = mutableSetOf<String>()
+    // 记录已处理的 DATA_PATH_REQUEST，避免重复响应导致死循环
+    private val processedDataPathRequests = mutableSetOf<String>()
     private val msgId = AtomicInteger(1)
     private var eventSink: EventChannel.EventSink? = null
 
     fun setEventSink(sink: EventChannel.EventSink?) {
         eventSink = sink
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            dataPathManager?.setEventSink(sink)
+        }
     }
 
     private fun emit(event: Map<String, Any?>) {
@@ -166,8 +180,69 @@ class NanManager(private val context: Context) {
 
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) {
                 val text = try { String(message, StandardCharsets.UTF_8) } catch (_: Throwable) { "<bin>" }
-                Log.d(tag, "publish received from peer: $text")
+                Log.i(tag, "!!! PUBLISH onMessageReceived called !!!")
+                Log.i(tag, "Message content: [$text]")
+                Log.i(tag, "PeerHandle: ${peerHandle.hashCode()}")
                 if (!pubPeers.contains(peerHandle)) pubPeers.add(peerHandle)
+                
+                // 检查是否是数据路径协商消息 (与 Subscribe 相同的逻辑)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    Log.i(tag, "Checking if message is DATA_PATH_REQUEST...")
+                    if (text.startsWith("DATA_PATH_REQUEST:")) {
+                        Log.i(tag, "!!! DATA_PATH_REQUEST detected in PUBLISH !!!")
+                        // 收到数据路径请求，自动响应
+                        val parts = text.split(":")
+                        if (parts.size >= 2) {
+                            val requesterDevId = parts[1]
+                            Log.i(tag, "!!! Parsed requester deviceId: $requesterDevId !!!")
+                            
+                            // 检查是否已经处理过此设备的请求
+                            if (processedDataPathRequests.contains(requesterDevId)) {
+                                Log.i(tag, "Already processed DATA_PATH_REQUEST from $requesterDevId, ignoring")
+                                return // 已处理，避免重复响应
+                            }
+                            processedDataPathRequests.add(requesterDevId)
+                            
+                            // 找到对应的 peerId
+                            val session = pub
+                            Log.i(tag, "Publish session exists: ${session != null}")
+                            if (session != null) {
+                                Log.i(tag, "Calling DataPathManager.registerPeer...")
+                                val peerId = dataPathManager?.registerPeer(peerHandle, requesterDevId, session)
+                                Log.i(tag, "registerPeer returned: $peerId")
+                                if (peerId != null) {
+                                    Log.i(tag, "!!! Auto-responding to DATA_PATH_REQUEST, peerId=$peerId !!!")
+                                    
+                                    // 发送 ACK
+                                    try {
+                                        val ackMsg = "DATA_PATH_ACK"
+                                        val ackData = ackMsg.toByteArray(StandardCharsets.UTF_8)
+                                        val ackId = msgId.getAndIncrement()
+                                        pub?.sendMessage(peerHandle, ackId, ackData)
+                                    } catch (_: Throwable) {}
+                                    
+                                    // 延迟后调用 openDataPath (使用固定passphrase)
+                                    Log.i(tag, "Scheduling openDataPath for peer $peerId after 200ms delay...")
+                                    handler.postDelayed({
+                                        Log.i(tag, "!!! Executing delayed openDataPath for peer $peerId !!!")
+                                        dataPathManager?.openDataPath(
+                                            peerId = peerId,
+                                            passphrase = "aiocr_data_path_2024", // 固定passphrase
+                                            onSuccess = {
+                                                Log.i(tag, "!!! SUCCESS: Auto data path established for peer $peerId !!!")
+                                            },
+                                            onError = { err ->
+                                                Log.e(tag, "!!! ERROR: Auto data path failed for peer $peerId: $err !!!")
+                                            }
+                                        )
+                                    }, 200) // 极短延迟，快速响应
+                                }
+                            }
+                        }
+                        return // 已处理，不再继续
+                    }
+                }
+                
                 // 尝试解析消息信封中的 sender 以去重与映射
                 try {
                     val json = org.json.JSONObject(text)
@@ -233,6 +308,15 @@ class NanManager(private val context: Context) {
                 val totalPeers = peerIds.size
                 Log.d(tag, "service discovered; peers=$totalPeers")
                 emit(mapOf("type" to "discovered", "peers" to totalPeers))
+                
+                // 注册到 DataPathManager（API 29+）
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val session = sub
+                    if (session != null) {
+                        val peerId = dataPathManager?.registerPeer(peerHandle, devId, session)
+                        Log.d(tag, "Registered peer in DataPathManager: peerId=$peerId, devId=$devId")
+                    }
+                }
                 // 使用订阅会话直接发送握手（仅对未握手的设备）
                 val targetId = devId ?: (peerHandle.hashCode().toString())
                 if (!handshakedIds.contains(targetId)) {
@@ -255,8 +339,75 @@ class NanManager(private val context: Context) {
 
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) {
                 val text = try { String(message, StandardCharsets.UTF_8) } catch (_: Throwable) { "<bin>" }
-                Log.d(tag, "sub received: $text")
+                Log.i(tag, "!!! SUBSCRIBE onMessageReceived called !!!")
+                Log.i(tag, "Message content: [$text]")
+                Log.i(tag, "PeerHandle: ${peerHandle.hashCode()}")
                 if (!subPeers.contains(peerHandle)) subPeers.add(peerHandle)
+                
+                // 检查是否是数据路径协商消息
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    Log.i(tag, "Checking if message is DATA_PATH_REQUEST...")
+                    if (text.startsWith("DATA_PATH_REQUEST:")) {
+                        Log.i(tag, "!!! DATA_PATH_REQUEST detected !!!")
+                        // 收到数据路径请求,自动响应
+                        val parts = text.split(":")
+                        if (parts.size >= 2) {
+                            val requesterDevId = parts[1]
+                            Log.i(tag, "!!! Parsed requester deviceId: $requesterDevId !!!")
+                            
+                            // 检查是否已经处理过此设备的请求
+                            if (processedDataPathRequests.contains(requesterDevId)) {
+                                Log.i(tag, "Already processed DATA_PATH_REQUEST from $requesterDevId, ignoring")
+                                return // 已处理，避免重复响应
+                            }
+                            processedDataPathRequests.add(requesterDevId)
+                            
+                            // 找到对应的 peerId
+                            val session = sub
+                            Log.i(tag, "Subscribe session exists: ${session != null}")
+                            if (session != null) {
+                                Log.i(tag, "Calling DataPathManager.registerPeer...")
+                                val peerId = dataPathManager?.registerPeer(peerHandle, requesterDevId, session)
+                                Log.i(tag, "registerPeer returned: $peerId")
+                                if (peerId != null) {
+                                    Log.i(tag, "!!! Auto-responding to DATA_PATH_REQUEST, peerId=$peerId !!!")
+                                    
+                                    // 发送 ACK
+                                    try {
+                                        val ackMsg = "DATA_PATH_ACK"
+                                        val ackData = ackMsg.toByteArray(StandardCharsets.UTF_8)
+                                        val ackId = msgId.getAndIncrement()
+                                        sub?.sendMessage(peerHandle, ackId, ackData)
+                                    } catch (_: Throwable) {}
+                                    
+                                    // 关键修改：延迟后也调用 openDataPath
+                                    // Wi-Fi Aware Data Path 需要双方都调用 requestNetwork()
+                                    // 系统会根据 DiscoverySession 类型自动分配 initiator/responder 角色
+                                    Log.i(tag, "Scheduling openDataPath for peer $peerId after 200ms delay...")
+                                    handler.postDelayed({
+                                        Log.i(tag, "!!! Executing delayed openDataPath for peer $peerId !!!")
+                                        dataPathManager?.openDataPath(
+                                            peerId = peerId,
+                                            passphrase = "aiocr_data_path_2024", // 固定passphrase
+                                            onSuccess = {
+                                                Log.i(tag, "!!! SUCCESS: Auto data path established for peer $peerId !!!")
+                                            },
+                                            onError = { err ->
+                                                Log.e(tag, "!!! ERROR: Auto data path failed for peer $peerId: $err !!!")
+                                            }
+                                        )
+                                    }, 200) // 极短延迟，快速响应
+                                }
+                            }
+                            return // 不再作为普通消息处理
+                        }
+                    } else if (text == "DATA_PATH_ACK") {
+                        Log.d(tag, "Received DATA_PATH_ACK")
+                        emit(mapOf("type" to "message", "via" to "subscribe", "text" to "DATA_PATH_ACK"))
+                        return
+                    }
+                }
+                
                 // 尝试解析信封，新增对端 ID 并上报 peers 变化
                 try {
                     val json = org.json.JSONObject(text)
@@ -344,9 +495,9 @@ class NanManager(private val context: Context) {
     }
 
     fun release() {
-    try { pub?.close() } catch (_: Throwable) {}
-    try { sub?.close() } catch (_: Throwable) {}
-    try { session?.close() } catch (_: Throwable) {}
+        try { pub?.close() } catch (_: Throwable) {}
+        try { sub?.close() } catch (_: Throwable) {}
+        try { session?.close() } catch (_: Throwable) {}
         pub = null
         sub = null
         session = null
@@ -356,7 +507,43 @@ class NanManager(private val context: Context) {
         subIdToPeer.clear()
         pubIdToPeer.clear()
         handshakedIds.clear()
+        
+        // 释放数据路径资源
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            dataPathManager?.releaseAll()
+        }
+        
         emit(mapOf("type" to "released"))
+    }
+    
+    // === Data Path 相关方法（API 29+）===
+    
+    fun listDataPathPeers(): List<Map<String, Any?>>? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            dataPathManager?.listPeers()
+        } else null
+    }
+    
+    fun openDataPath(peerId: Int, passphrase: String?, onSuccess: (() -> Unit)?, onError: ((String) -> Unit)?) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            dataPathManager?.openDataPath(peerId, passphrase, onSuccess = onSuccess, onError = onError)
+        } else {
+            onError?.invoke("Data path requires Android 10+")
+        }
+    }
+    
+    fun sendLargeText(peerId: Int, text: String, onSuccess: (() -> Unit)?, onError: ((String) -> Unit)?) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            dataPathManager?.sendLargeText(peerId, text, onSuccess = onSuccess, onError = onError)
+        } else {
+            onError?.invoke("Data path requires Android 10+")
+        }
+    }
+    
+    fun closeDataPath(peerId: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            dataPathManager?.closeDataPath(peerId)
+        }
     }
 
     private fun parseRoomFromSsi(ssi: String?): String? {

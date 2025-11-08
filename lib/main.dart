@@ -126,6 +126,11 @@ class _MyHomePageState extends State<MyHomePage> {
   String? _backendBaseUrl;
   final TextEditingController _backendController = TextEditingController();
   final List<String> _debugLogs = [];
+  
+  // Data Path 相关状态
+  final Map<int, Map<String, dynamic>> _dataPathPeers = {};
+  final Set<int> _dataPathReady = {};
+  bool _autoUseDataPath = true;
 
   @override
   void initState() {
@@ -194,7 +199,76 @@ class _MyHomePageState extends State<MyHomePage> {
               _nanStatus = '已释放';
               _nanReady = false;
               _nanPeers = 0;
+              _dataPathPeers.clear();
+              _dataPathReady.clear();
             });
+            break;
+          case 'peerRegistered':
+            final peerId = map['peerId'] as int?;
+            final deviceId = map['deviceId'] as String?;
+            if (peerId != null) {
+              setState(() {
+                _dataPathPeers[peerId] = {
+                  'deviceId': deviceId,
+                  'hasDataPath': false,
+                };
+              });
+              _appendNanLog('已注册 peer: $peerId (设备: $deviceId)');
+            }
+            break;
+          case 'dataPath':
+            final peerId = map['peerId'] as int?;
+            final state = map['state'] as String?;
+            final role = map['role'] as String?;
+            if (peerId != null && state != null) {
+              _appendNanLog('数据路径 peer=$peerId state=$state role=${role ?? '-'}');
+              setState(() {
+                if (state == 'available') {
+                  _dataPathReady.add(peerId);
+                  if (_dataPathPeers.containsKey(peerId)) {
+                    _dataPathPeers[peerId]!['hasDataPath'] = true;
+                  }
+                } else if (state == 'closed' || state == 'lost' || state == 'unavailable') {
+                  _dataPathReady.remove(peerId);
+                  if (_dataPathPeers.containsKey(peerId)) {
+                    _dataPathPeers[peerId]!['hasDataPath'] = false;
+                  }
+                }
+              });
+            }
+            break;
+          case 'dataMessage':
+            final peerId = map['peerId'] as int?;
+            final text = map['text'] as String?;
+            final bytes = map['bytes'] as int?;
+            if (text != null) {
+              // 日志中显示前200字符预览
+              final preview = text.length > 200 ? '${text.substring(0, 200)}...' : text;
+              _appendNanLog('收到数据消息 from peer=$peerId (${bytes ?? text.length} bytes): $preview');
+              _appendNanLog('完整数据已保存到结果区域,可点击"复制结果"查看完整内容');
+              
+              // 显示完整内容在结果区域
+              setState(() {
+                _resultText = text;
+              });
+              
+              // 显示提示
+              final messenger = ScaffoldMessenger.of(context);
+              messenger.showSnackBar(SnackBar(
+                content: Text('收到来自设备 $peerId 的数据 (${bytes ?? text.length} bytes)'),
+                duration: const Duration(seconds: 2),
+              ));
+            }
+            break;
+          case 'dataSent':
+            final peerId = map['peerId'] as int?;
+            final bytes = map['bytes'] as int?;
+            _appendNanLog('数据已发送到 peer=$peerId (${bytes ?? 0} bytes)');
+            break;
+          case 'dataSendError':
+            final peerId = map['peerId'] as int?;
+            final error = map['error'] as String?;
+            _appendNanLog('数据发送失败 peer=$peerId: $error');
             break;
         }
       } catch (_) {}
@@ -681,6 +755,38 @@ class _MyHomePageState extends State<MyHomePage> {
       messenger.showSnackBar(const SnackBar(content: Text('没有可发送的分析结果')));
       return;
     }
+    
+    // 自动判断是否使用数据路径
+    if (_autoUseDataPath && Platform.isAndroid) {
+      final textBytes = utf8.encode(text);
+      final limit = await _ensureNanMaxMessageLen();
+      
+      // 如果文本超过限制，尝试使用数据路径
+      if (textBytes.length > limit * 0.8) { // 80% 阈值
+        _appendNanLog('文本过长 (${textBytes.length} bytes)，尝试使用数据路径...');
+        
+        if (_dataPathReady.isNotEmpty) {
+          // 使用第一个可用的数据路径
+          await _sendViaDataPath();
+          return;
+        } else if (_dataPathPeers.isNotEmpty) {
+          // 尝试建立数据路径
+          messenger.showSnackBar(
+            const SnackBar(content: Text('正在建立数据路径，请稍候...')),
+          );
+          await _openDataPathToFirstPeer();
+          // 等待连接建立
+          await Future.delayed(const Duration(seconds: 2));
+          if (_dataPathReady.isNotEmpty) {
+            await _sendViaDataPath();
+            return;
+          }
+        }
+        // 如果无法使用数据路径，继续使用普通方式（会被截断）
+        _appendNanLog('无法使用数据路径，将使用普通消息（可能被截断）');
+      }
+    }
+    
     try {
       final built = await _buildNanMessageRespectingLimit(type: 'analysis', body: text);
       await _nan.invokeMethod('broadcast', {'text': built.message});
@@ -688,6 +794,101 @@ class _MyHomePageState extends State<MyHomePage> {
       if (mounted) messenger.showSnackBar(const SnackBar(content: Text('已通过 NAN 发送分析结果')));
     } catch (e) {
       if (mounted) messenger.showSnackBar(SnackBar(content: Text('发送失败: $e')));
+    }
+  }
+  
+  // === Data Path 相关方法 ===
+  
+  Future<void> _listDataPathPeers() async {
+    try {
+      final peers = await _nan.invokeMethod('listDataPathPeers') as List?;
+      if (peers != null && peers.isNotEmpty) {
+        _appendNanLog('可用 peers: ${peers.length}');
+        for (final peer in peers) {
+          final map = Map<String, dynamic>.from(peer as Map);
+          _appendNanLog('  - peerId=${map['peerId']}, deviceId=${map['deviceId']}, hasDataPath=${map['hasDataPath']}');
+        }
+      } else {
+        _appendNanLog('暂无可用 peers');
+      }
+    } catch (e) {
+      _appendNanLog('查询 peers 失败: $e');
+    }
+  }
+  
+  Future<void> _openDataPathToFirstPeer() async {
+    final messenger = ScaffoldMessenger.of(context);
+    
+    if (_dataPathPeers.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('尚未发现可连接的设备')));
+      return;
+    }
+    
+    // 找到第一个尚未建立数据路径的 peer
+    int? targetPeerId;
+    for (final entry in _dataPathPeers.entries) {
+      if (entry.value['hasDataPath'] != true) {
+        targetPeerId = entry.key;
+        break;
+      }
+    }
+    
+    if (targetPeerId == null) {
+      // 所有 peer 都已建立，使用第一个
+      targetPeerId = _dataPathPeers.keys.first;
+    }
+    
+    try {
+      _appendNanLog('正在建立数据路径到 peer=$targetPeerId...');
+      await _nan.invokeMethod('openDataPath', {
+        'peerId': targetPeerId,
+        'passphrase': 'aiocr_data_path_2024', // 固定passphrase,与自动响应保持一致
+      });
+      messenger.showSnackBar(SnackBar(content: Text('正在连接设备 $targetPeerId...')));
+    } catch (e) {
+      _appendNanLog('建立数据路径失败: $e');
+      messenger.showSnackBar(SnackBar(content: Text('连接失败: $e')));
+    }
+  }
+  
+  Future<void> _sendViaDataPath() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final text = _resultText;
+    
+    if (text == null || text.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('无分析结果可发送')));
+      return;
+    }
+    
+    if (_dataPathReady.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('数据路径尚未建立')));
+      return;
+    }
+    
+    // 使用第一个可用的数据路径
+    final targetPeerId = _dataPathReady.first;
+    
+    try {
+      _appendNanLog('通过数据路径发送 ${utf8.encode(text).length} bytes 到 peer=$targetPeerId...');
+      await _nan.invokeMethod('sendLargeText', {
+        'peerId': targetPeerId,
+        'text': text,
+      });
+      messenger.showSnackBar(SnackBar(content: Text('已通过数据路径发送到设备 $targetPeerId')));
+    } catch (e) {
+      _appendNanLog('数据路径发送失败: $e');
+      messenger.showSnackBar(SnackBar(content: Text('发送失败: $e')));
+    }
+  }
+  
+  Future<void> _closeAllDataPaths() async {
+    for (final peerId in _dataPathReady.toList()) {
+      try {
+        await _nan.invokeMethod('closeDataPath', {'peerId': peerId});
+        _appendNanLog('已关闭数据路径 peer=$peerId');
+      } catch (e) {
+        _appendNanLog('关闭数据路径失败 peer=$peerId: $e');
+      }
     }
   }
 
@@ -1000,6 +1201,15 @@ class _MyHomePageState extends State<MyHomePage> {
                 children: [
                   Chip(label: Text('状态: $_nanStatus')),
                   Chip(label: Text('Peers: $_nanPeers')),
+                  Chip(
+                    label: Text('数据路径: ${_dataPathPeers.length}/${_dataPathReady.length}'),
+                    backgroundColor: _dataPathReady.isNotEmpty ? Colors.green.shade100 : null,
+                  ),
+                  FilterChip(
+                    label: const Text('自动数据路径'),
+                    selected: _autoUseDataPath,
+                    onSelected: (selected) => setState(() => _autoUseDataPath = selected),
+                  ),
                 ],
               ),
               const SizedBox(height: 8),
@@ -1032,13 +1242,45 @@ class _MyHomePageState extends State<MyHomePage> {
                 ],
               ),
               const SizedBox(height: 8),
-              Align(
-                alignment: Alignment.centerRight,
-                child: FilledButton.tonalIcon(
-                  onPressed: (_nanReady && _resultText != null && _resultText!.isNotEmpty) ? _sendAnalysisOverNan : null,
-                  icon: const Icon(Icons.send),
-                  label: const Text('通过 NAN 发送分析结果'),
-                ),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: (_nanReady && _resultText != null && _resultText!.isNotEmpty) ? _sendAnalysisOverNan : null,
+                      icon: const Icon(Icons.send),
+                      label: const Text('发送分析结果'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Text('数据路径传输（长文本）', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: _nanReady ? _openDataPathToFirstPeer : null,
+                    icon: const Icon(Icons.link),
+                    label: const Text('建立数据路径'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: (_dataPathReady.isNotEmpty && _resultText != null && _resultText!.isNotEmpty) ? _sendViaDataPath : null,
+                    icon: const Icon(Icons.send_and_archive),
+                    label: const Text('通过数据路径发送'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _nanReady ? _listDataPathPeers : null,
+                    icon: const Icon(Icons.list),
+                    label: const Text('列出 Peers'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _dataPathReady.isNotEmpty ? _closeAllDataPaths : null,
+                    icon: const Icon(Icons.link_off),
+                    label: const Text('关闭所有连接'),
+                  ),
+                ],
               ),
               const SizedBox(height: 12),
               Card(
