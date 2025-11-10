@@ -8,6 +8,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'camera_capture_page.dart';
 import 'settings_page.dart';
+import 'client_page.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -106,7 +107,8 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
+class _MyHomePageState extends State<MyHomePage> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
   XFile? _photo;
   bool _isAnalyzing = false;
   String? _resultText;
@@ -135,6 +137,7 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 2, vsync: this);
     _initDeviceId();
     _initRoomCode();
     _initBackendBaseUrl();
@@ -318,6 +321,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
   @override
   void dispose() {
+    _tabController.dispose();
     _nanSub?.cancel();
     _roomController.dispose();
     _backendController.dispose();
@@ -987,27 +991,8 @@ class _MyHomePageState extends State<MyHomePage> {
     return granted;
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: Text(widget.title),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.settings),
-            tooltip: '后端 API 设置',
-            onPressed: () async {
-              await Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const SettingsPage()),
-              );
-              // 返回后重新加载后端地址
-              await _initBackendBaseUrl();
-            },
-          ),
-        ],
-      ),
-      body: SafeArea(
+  Widget _buildServerPage() {
+    return SafeArea(
         bottom: true,
         child: SingleChildScrollView(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
@@ -1384,6 +1369,42 @@ class _MyHomePageState extends State<MyHomePage> {
             ],
           ),
         ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: Text(widget.title),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: '服务端', icon: Icon(Icons.cloud)),
+            Tab(text: '客户端', icon: Icon(Icons.phone_android)),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: '后端 API 设置',
+            onPressed: () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const SettingsPage()),
+              );
+              // 返回后重新加载后端地址
+              await _initBackendBaseUrl();
+            },
+          ),
+        ],
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _buildServerPage(),
+          const ClientPage(),
+        ],
       ),
     );
   }
